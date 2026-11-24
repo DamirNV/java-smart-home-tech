@@ -1,3 +1,4 @@
+
 # Smart Home Tech
 
 Учебный микросервисный проект системы умного дома и интернет-магазина устройств.
@@ -5,7 +6,7 @@
 Проект состоит из двух основных частей:
 
 - **Telemetry** — принимает события датчиков и хабов по HTTP или gRPC, передаёт их через Kafka, формирует актуальные снимки состояния устройств, проверяет пользовательские сценарии и отправляет команды на их выполнение в Hub Router.
-- **Commerce** — реализует каталог товаров, складские остатки и заказы. Для централизованной конфигурации и обнаружения сервисов используются Spring Cloud Config и Eureka.
+- **Commerce** — реализует каталог товаров, складские остатки и заказы. `order-service` взаимодействует с каталогом и складом через OpenFeign, резервирует товары и компенсирует выполненные резервы при ошибках. Для централизованной конфигурации и обнаружения сервисов используются Spring Cloud Config и Eureka. Внешний доступ к Commerce API организован через Spring Cloud Gateway с HTTP Basic и ролевой моделью.
 
 ## Архитектура
 
@@ -36,8 +37,9 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    DS[Discovery Server<br/>Eureka :8761]
-    CS[Config Server :8888]
+    Client[HTTP-клиент] --> GW[API Gateway]
+    DS[Discovery Server / Eureka]
+    CS[Config Server]
 
     P[Product Service]
     I[Inventory Service]
@@ -47,11 +49,18 @@ flowchart LR
     IDB[(inventory_db)]
     ODB[(order_db)]
 
+    GW -->|HTTP| P
+    GW -->|HTTP| I
+    GW -->|HTTP| O
+    O -->|OpenFeign: товар| P
+    O -->|OpenFeign: резерв / снятие резерва| I
+
+    CS -. конфигурация .-> GW
     CS -. конфигурация .-> P
     CS -. конфигурация .-> I
     CS -. конфигурация .-> O
 
-    CS -. регистрация .-> DS
+    GW -. обнаружение .-> DS
     P -. регистрация .-> DS
     I -. регистрация .-> DS
     O -. регистрация .-> DS
@@ -63,7 +72,9 @@ flowchart LR
 
 Commerce-сервисы используют подход **Database per Service**: каждый сервис владеет собственной базой данных и не обращается напрямую к данным другого сервиса.
 
-На текущем этапе `product-service`, `inventory-service` и `order-service` также не выполняют бизнес-вызовы друг к другу.
+`order-service` выполняет бизнес-вызовы `product-service` и `inventory-service` через OpenFeign: проверяет доступность и активность товара, резервирует нужное количество, затем сохраняет заказ. При частичном сбое выполняется попытка компенсирующего снятия ранее созданных резервов. При недоступности зависимости заказ может сохраняться со статусом `PENDING_CONFIRMATION` для последующей ручной проверки.
+
+API Gateway маршрутизирует запросы к Commerce-сервисам через Eureka и применяет правила доступа: публичное чтение каталога и остатков, роль `USER` для операций с собственными заказами и роль `ADMIN` для изменения каталога/остатков и просмотра всех заказов. В учебной конфигурации используется HTTP Basic с демонстрационными пользователями.
 
 ## Модули
 
@@ -76,6 +87,7 @@ Commerce-сервисы используют подход **Database per Service
 | `telemetry/serialization/proto-schemas` | Protobuf-сообщения и контракты gRPC |
 | `infra/config-server` | Централизованная конфигурация Spring Cloud Config |
 | `infra/discovery-server` | Eureka Server для регистрации и обнаружения сервисов |
+| `infra/api-gateway` | Единая точка входа в Commerce API; Spring Cloud Gateway, Spring Security и маршрутизация через Eureka |
 | `infra/config-repo` | Внешние конфигурации сервисов |
 | `commerce/product-service` | Каталог товаров и категорий |
 | `commerce/inventory-service` | Складские остатки и резервирование товаров |
@@ -87,6 +99,8 @@ Commerce-сервисы используют подход **Database per Service
 - Java 21
 - Spring Boot 3.3.2
 - Spring Cloud Config
+- Spring Cloud Gateway и Spring Security (HTTP Basic)
+- Spring Cloud OpenFeign, Resilience4j
 - Netflix Eureka
 - Spring Data JPA и Hibernate
 - PostgreSQL 16
@@ -299,7 +313,10 @@ availableQuantity = quantity - reservedQuantity
 
 Поддерживаются:
 
-- создание заказа;
+- создание заказа с проверкой товаров через `product-service`;
+- резервирование остатков через `inventory-service`;
+- компенсирующее снятие уже выполненных резервов при сбоях;
+- резервный сценарий с `PENDING_CONFIRMATION`, если зависимый сервис недоступен;
 - получение заказа по ID;
 - получение всех заказов;
 - поиск заказов по email покупателя;
@@ -314,7 +331,7 @@ availableQuantity = quantity - reservedQuantity
 
 Общая стоимость рассчитывается как сумма `quantity × price`.
 
-Новый заказ создаётся со статусом `CREATED`.
+Успешно оформленный заказ сохраняется со статусом `CONFIRMED`. Если `product-service` или `inventory-service` недоступен, заказ может сохраняться со статусом `PENDING_CONFIRMATION` с объяснением причины; это не означает успешного резервирования. При недоступности каталога цена временно устанавливается в `0` до ручной проверки.
 
 База данных: `order_db`.
 
@@ -366,7 +383,7 @@ Eureka Dashboard:
 http://localhost:8761
 ```
 
-Config Server и commerce-сервисы регистрируются в Eureka.
+Config Server, API Gateway и commerce-сервисы регистрируются в Eureka при их запуске.
 
 Commerce-сервисы используют динамические HTTP-порты:
 
@@ -375,7 +392,7 @@ server:
   port: 0
 ```
 
-После запуска в Eureka должны быть зарегистрированы:
+После запуска инфраструктуры и Commerce-сервисов в Eureka должны быть зарегистрированы:
 
 ```text
 CONFIG-SERVER
@@ -383,6 +400,8 @@ PRODUCT-SERVICE
 INVENTORY-SERVICE
 ORDER-SERVICE
 ```
+
+При отдельном запуске API Gateway добавляется `API-GATEWAY`.
 
 ## Требования
 
@@ -466,7 +485,19 @@ java -jar commerce/inventory-service/target/inventory-service-1.0-SNAPSHOT.jar
 java -jar commerce/order-service/target/order-service-1.0-SNAPSHOT.jar
 ```
 
-### 6. Запустить Telemetry
+### 6. При необходимости запустить API Gateway
+
+API Gateway позволяет обращаться к Commerce-сервисам через одну точку входа и проверяет права через HTTP Basic.
+
+**Важно:** в исходной конфигурации `api-gateway` и `collector` оба используют HTTP-порт `8080`. Чтобы запустить оба компонента на одной машине, запустите Gateway на другом порту через аргумент командной строки:
+
+```bash
+java -jar infra/api-gateway/target/api-gateway-1.0-SNAPSHOT.jar --server.port=8081
+```
+
+Тогда Commerce API будет доступен через `http://localhost:8081/api/...`; при работе с защищёнными методами потребуется HTTP Basic. В учебной конфигурации для Gateway заданы демонстрационные пользователи. Не используйте эти учётные данные в публичном развёртывании.
+
+### 7. Запустить Telemetry
 
 Collector:
 
@@ -493,12 +524,17 @@ java -jar telemetry/analyzer/target/analyzer-1.0-SNAPSHOT.jar
 | Collector | HTTP | `8080` |
 | Collector | gRPC | `59091` |
 | Hub Router | gRPC | `59090` |
+| API Gateway (если запущен с переопределением порта) | HTTP | `8081` |
+
+> При запуске Gateway без `--server.port=8081` возникнет конфликт с HTTP-портом Collector (`8080`).
 
 > Analyzer должен иметь доступ к Hub Router на `localhost:59090`.
 
 ## Тестирование
 
 ### Тесты проекта
+
+В архиве обнаружены **33 тестовых метода** в шести тестовых классах: сценарии Commerce, проверка оркестрации заказов, безопасность API Gateway и агрегация телеметрии. Это количество определено по аннотациям тестов; фактическое успешное выполнение в рамках подготовки README не проверялось.
 
 ```bash
 mvn clean test
@@ -603,6 +639,7 @@ plus-smart-home-tech/
 ├── infra/
 │   ├── config-server/
 │   ├── discovery-server/
+│   ├── api-gateway/
 │   └── config-repo/
 │       └── commerce/
 │
