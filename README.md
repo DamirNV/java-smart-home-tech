@@ -622,7 +622,7 @@ docker compose down -v --remove-orphans
 ## Структура проекта
 
 ```text
-plus-smart-home-tech/
+java-smart-home-tech/
 ├── telemetry/
 │   ├── collector/
 │   ├── aggregator/
